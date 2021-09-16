@@ -17,6 +17,7 @@ from localstack import config
 from localstack.constants import (
     APPLICATION_JSON,
     HEADER_LOCALSTACK_REQUEST_URL,
+    LOCALHOST_HOSTNAME,
     TEST_AWS_ACCOUNT_ID,
 )
 from localstack.services.apigateway.helpers import (
@@ -1109,7 +1110,7 @@ class TestAPIGateway(unittest.TestCase):
         )
 
         def _prepare_method_integration(
-            integr_kwargs={}, resp_templates={}, exec_async=True, overwrite=False
+            integr_kwargs={}, resp_templates={}, action="StartExecution", overwrite=False
         ):
             if overwrite:
                 client.delete_integration(
@@ -1117,7 +1118,6 @@ class TestAPIGateway(unittest.TestCase):
                     resourceId=resources["items"][0]["id"],
                     httpMethod="POST",
                 )
-            action = f"Start{'' if exec_async else 'Sync'}Execution"
             uri = f"arn:aws:apigateway:{aws_stack.get_region()}:states:action/{action}"
             client.put_integration(
                 restApiId=rest_api["id"],
@@ -1179,7 +1179,7 @@ class TestAPIGateway(unittest.TestCase):
 
         # STEP 3: test integration with synchronous execution
 
-        _prepare_method_integration(overwrite=True, exec_async=False)
+        _prepare_method_integration(overwrite=True, action="StartSyncExecution")
 
         # invoke stepfunction via API GW, assert results
         test_data_1["name"] += "1"
@@ -1192,7 +1192,9 @@ class TestAPIGateway(unittest.TestCase):
         # STEP 4: test integration with synchronous execution and response templates
 
         resp_templates = {APPLICATION_JSON: "$input.path('$.output')"}
-        _prepare_method_integration(resp_templates=resp_templates, overwrite=True, exec_async=False)
+        _prepare_method_integration(
+            resp_templates=resp_templates, overwrite=True, action="StartSyncExecution"
+        )
 
         # invoke stepfunction via API GW, assert results
         test_data_1["name"] += "2"
@@ -1200,9 +1202,14 @@ class TestAPIGateway(unittest.TestCase):
         self.assertEqual(200, resp.status_code)
         self.assertEqual(test_data, json.loads(to_str(resp.content.decode())))
 
+        _prepare_method_integration(overwrite=True, action="DeleteStateMachine")
+
+        # Remove state machine with API GW
+        resp = requests.post(url, data=json.dumps({"stateMachineArn": sm_arn}))
+        self.assertEqual(200, resp.status_code)
+
         # Clean up
         lambda_client.delete_function(FunctionName=fn_name)
-        sfn_client.delete_state_machine(stateMachineArn=sm_arn)
         client.delete_rest_api(restApiId=rest_api["id"])
 
     def test_api_gateway_http_integration_with_path_request_parameter(self):
@@ -1244,19 +1251,42 @@ class TestAPIGateway(unittest.TestCase):
             requestParameters={"integration.request.path.id": "method.request.path.id"},
         )
         client.create_deployment(restApiId=api_id, stageName="test")
-        url = (
-            f"http://localhost:{config.EDGE_PORT}/restapis/{api_id}/test/_user_request_/person/123"
-        )
-        result = requests.get(url)
-        content = json.loads(result._content)
-        self.assertEqual(200, result.status_code)
-        self.assertEqual(
-            f"http://localhost:{config.EDGE_PORT}/person/123",
-            content["headers"].get(HEADER_LOCALSTACK_REQUEST_URL),
-        )
+
+        def _test_invoke(url):
+            result = requests.get(url)
+            content = json.loads(result._content)
+            self.assertEqual(200, result.status_code)
+            self.assertRegexpMatches(
+                content["headers"].get(HEADER_LOCALSTACK_REQUEST_URL),
+                f"http://.*localhost.*:{config.EDGE_PORT}/person/123",
+            )
+
+        for use_hostname in [True, False]:
+            for use_ssl in [True, False] if use_hostname else [False]:
+                url = self._get_invoke_endpoint(
+                    api_id,
+                    stage="test",
+                    path="/person/123",
+                    use_hostname=use_hostname,
+                    use_ssl=use_ssl,
+                )
+                _test_invoke(url)
+
         # clean up
         client.delete_rest_api(restApiId=api_id)
         proxy.stop()
+
+    def _get_invoke_endpoint(
+        self, api_id, stage="test", path="/", use_hostname=False, use_ssl=False
+    ):
+        path = path or "/"
+        path = path if path.startswith(path) else f"/{path}"
+        proto = "https" if use_ssl else "http"
+        if use_hostname:
+            return f"{proto}://{api_id}.execute-api.{LOCALHOST_HOSTNAME}:{config.EDGE_PORT}/{stage}{path}"
+        return (
+            f"{proto}://localhost:{config.EDGE_PORT}/restapis/{api_id}/{stage}/_user_request_{path}"
+        )
 
     def test_api_gateway_s3_get_integration(self):
         apigw_client = aws_stack.connect_to_service("apigateway")

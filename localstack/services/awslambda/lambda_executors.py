@@ -634,6 +634,7 @@ class LambdaExecutorReuseContainers(LambdaExecutorContainers):
         lambda_cwd = func_details.cwd
         runtime = func_details.runtime
         handler = func_details.handler
+        env_vars = {} if env_vars is None else env_vars
 
         # check whether the Lambda has been invoked before
         has_been_invoked_before = func_arn in self.function_invoke_times
@@ -1193,12 +1194,14 @@ class LambdaExecutorLocal(LambdaExecutor):
                 os.environ.pop(env_name, None)
 
     def execute_go_lambda(self, event, context, main_file, func_details=None):
-        event_json_string = "%s" % (json.dumps(event) if event else "{}")
-        cmd = "AWS_LAMBDA_FUNCTION_HANDLER=%s AWS_LAMBDA_EVENT_BODY='%s' %s" % (
-            main_file,
-            event_json_string,
-            GO_LAMBDA_RUNTIME,
-        )
+
+        if func_details:
+            func_details.envvars["AWS_LAMBDA_FUNCTION_HANDLER"] = main_file
+            func_details.envvars["AWS_LAMBDA_EVENT_BODY"] = json.dumps(json_safe(event))
+        else:
+            LOG.warning("Unable to get function details for local execution of Golang Lambda")
+
+        cmd = GO_LAMBDA_RUNTIME
         LOG.info(cmd)
         result = self._execute_in_custom_runtime(cmd, func_details=func_details)
         return result

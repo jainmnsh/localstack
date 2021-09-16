@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -849,15 +850,19 @@ class Util:
         env_vars: Dict[str, str] = None,
         ports: PortMappings = None,
         mounts: List[Tuple[str, str]] = None,
-    ) -> Tuple[Dict[str, str], PortMappings, List[Tuple[str, str]], Optional[Dict[str, str]]]:
+        network: Optional[str] = None,
+    ) -> Tuple[
+        Dict[str, str], PortMappings, List[Tuple[str, str]], Optional[Dict[str, str]], Optional[str]
+    ]:
         """Parses environment, volume and port flags passed as string
         :param additional_flags: String which contains the flag definitions
         :param env_vars: Dict with env vars. Will be modified in place.
         :param ports: PortMapping object. Will be modified in place.
         :param mounts: List of mount tuples (host_path, container_path). Will be modified in place.
-        :return: A tuple containing the env_vars, ports and mount objects. Will return new objects if respective
-                parameters were None and additional flags contained a flag for that object, the same which are passed
-                otherwise.
+        :param network: Existing network name (optional). Warning will be printed if network is overwritten in flags.
+        :return: A tuple containing the env_vars, ports, mount, extra_hosts and network objects. Will return new objects
+                if respective parameters were None and additional flags contained a flag for that object, the same which
+                are passed otherwise.
         """
         cur_state = None
         extra_hosts = None
@@ -872,6 +877,8 @@ class Util:
                     cur_state = "env"
                 elif flag == "--add-host":
                     cur_state = "add-host"
+                elif flag == "--network":
+                    cur_state = "set-network"
                 else:
                     raise NotImplementedError(
                         "Flag %s is currently not supported by this docker client."
@@ -879,7 +886,19 @@ class Util:
             else:
                 if cur_state == "volume":
                     mounts = mounts if mounts is not None else []
-                    mounts.append(tuple(flag.split(":")))
+                    match = re.match(
+                        r"(?P<host>[\w\s\\\/:\-.]+?):(?P<container>[\w\s\/\-.]+)(?::(?P<arg>ro|rw|z|Z))?",
+                        flag,
+                    )
+                    if not match:
+                        LOG.warning("Unable to parse volume mount Docker flags: %s", flag)
+                        continue
+                    host_path = match.group("host")
+                    container_path = match.group("container")
+                    rw_args = match.group("arg")
+                    if rw_args:
+                        LOG.info("Volume options like :ro or :rw are currently ignored.")
+                    mounts.append((host_path, container_path))
                 elif cur_state == "port":
                     port_split = flag.split(":")
                     protocol = "tcp"
@@ -897,16 +916,24 @@ class Util:
                     ports = ports if ports is not None else PortMappings()
                     ports.add(int(host_port), int(container_port), protocol)
                 elif cur_state == "env":
-                    env_split = flag.split("=")
+                    lhs, _, rhs = flag.partition("=")
                     env_vars = env_vars if env_vars is not None else {}
-                    env_vars[env_split[0]] = env_split[1]
+                    env_vars[lhs] = rhs
                 elif cur_state == "add-host":
                     extra_hosts = extra_hosts if extra_hosts is not None else {}
                     hosts_split = flag.split(":")
                     extra_hosts[hosts_split[0]] = hosts_split[1]
+                elif cur_state == "set-network":
+                    if network:
+                        LOG.warning(
+                            "Overwriting Docker container network '%s' with new value '%s'",
+                            network,
+                            flag,
+                        )
+                    network = flag
 
                 cur_state = None
-        return env_vars, ports, mounts, extra_hosts
+        return env_vars, ports, mounts, extra_hosts, network
 
     @staticmethod
     def convert_mount_list_to_dict(
@@ -1224,8 +1251,8 @@ class SdkDockerClient(ContainerClient):
         )
         extra_hosts = None
         if additional_flags:
-            env_vars, ports, mount_volumes, extra_hosts = Util.parse_additional_flags(
-                additional_flags, env_vars, ports, mount_volumes
+            env_vars, ports, mount_volumes, extra_hosts, network = Util.parse_additional_flags(
+                additional_flags, env_vars, ports, mount_volumes, network
             )
         try:
             kwargs = {}
